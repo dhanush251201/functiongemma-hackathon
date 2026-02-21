@@ -272,9 +272,23 @@ def _run_subprocess(cmd, cwd=None, timeout=30):
         return _result(False, error=str(e))
 
 
-def exec_run_command(command: str, working_dir: str = "") -> dict:
+_SLOW_CMD_PREFIXES = (
+    "pip", "npm", "yarn", "pnpm", "poetry",
+    "docker", "docker-compose",
+    "cargo", "go build", "go get",
+    "mvn", "gradle", "./gradlew", "./mvnw",
+    "bundle install", "gem install",
+    "composer install",
+)
+_SLOW_TIMEOUT = 300  # 5 minutes for package installs / docker pulls
+
+
+def exec_run_command(command: str, working_dir: str = "", timeout: int = 0) -> dict:
     cwd = str(_safe_path(working_dir)) if working_dir else str(WORKSPACE_DIR)
-    return _run_subprocess(["bash", "-c", command], cwd=cwd)
+    if timeout <= 0:
+        cmd_lower = command.lstrip().lower()
+        timeout = _SLOW_TIMEOUT if any(cmd_lower.startswith(p) for p in _SLOW_CMD_PREFIXES) else 60
+    return _run_subprocess(["bash", "-c", command], cwd=cwd, timeout=timeout)
 
 
 def exec_check_port(port: int) -> dict:

@@ -1,5 +1,5 @@
 """
-All 20 tool definitions across 4 agents, with routing metadata.
+Tool definitions across all agents, with routing metadata.
 
 Each tool dict is OpenAI/Cactus compatible (name, description, parameters).
 The `_routing` key is our metadata — stripped before passing to models.
@@ -170,6 +170,34 @@ TOOL_INSTALL_DEPENDENCY = {
     "_agent": "builder",
 }
 
+TOOL_PLAN_SETUP_COMMANDS = {
+    "name": "plan_setup_commands",
+    "description": (
+        "Analyze a software repository and return an ordered list of shell commands "
+        "to fully set it up from scratch: install dependencies, configure environment, "
+        "build if needed, and start the app."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "commands": {
+                "type": "string",
+                "description": (
+                    "Ordered shell commands to run, one per line. "
+                    "Example: 'npm install\\ncp .env.example .env\\nnpm start'"
+                ),
+            },
+            "detected_type": {
+                "type": "string",
+                "description": "Detected project type: node, python, go, rust, java, etc.",
+            },
+        },
+        "required": ["commands"],
+    },
+    "_routing": "cloud",
+    "_agent": "builder",
+}
+
 # ─── RUNNER AGENT (all LOCAL) ─────────────────────────────────────────────────
 
 TOOL_RUN_COMMAND = {
@@ -323,6 +351,7 @@ BUILDER_TOOLS = [
     TOOL_CREATE_DOCKERFILE,
     TOOL_CREATE_DOCKER_COMPOSE,
     TOOL_INSTALL_DEPENDENCY,
+    TOOL_PLAN_SETUP_COMMANDS,
 ]
 
 RUNNER_TOOLS = [
