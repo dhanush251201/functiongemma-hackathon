@@ -213,3 +213,6 @@ server/
 
 # Leaderboard data
 docs/
+
+# Demo repos
+demo/
