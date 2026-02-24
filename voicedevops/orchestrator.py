@@ -41,7 +41,7 @@ from tools import (
     TOOL_PLAN_SETUP_COMMANDS, ALL_TOOLS, TOOL_MAP, strip_routing_metadata,
     TOOL_DIAGNOSE_ERROR,
 )
-from executor import execute_tool, get_workspace
+from executor import execute_tool, get_workspace, set_workspace, exec_clone_repo
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from main import generate_hybrid, generate_cloud
@@ -78,7 +78,16 @@ AGENTS = {
 }
 
 # "auto_setup" is a sentinel — not a real agent entry, handled directly in process()
+# "clone_setup" is a sentinel — clone repo first, then auto_setup
 _MULTI_AGENT_PATTERNS = [
+    # Clone + set up: "clone this repo and set it up", "clone and run", etc.
+    (re.compile(
+        r"clone\s+.+\s+(?:and\s+)?(?:set\s*up|setup|run|install|build|start)"
+        r"|clone\s+.*(?:repo|repository|project)"
+        r"|git\s+clone"
+        r"|clone\s+(?:this|it|a\s+repo)",
+        re.I,
+    ), ["clone_setup"]),
     # Generic repo-level setup (no specific service named) — must be checked FIRST
     (re.compile(
         # "set up this/the app/repo/project [for me]"
@@ -108,6 +117,28 @@ _MULTI_AGENT_PATTERNS = [
     (re.compile(r"install and run|install.*then run", re.I), ["builder", "runner", "tester"]),
 ]
 
+# Regex to extract a git URL from user text
+_GIT_URL_RE = re.compile(
+    r"((?:https?://|git@)[\w.:/-]+?(?:\.git)?)\b"
+)
+
+# Question patterns — triggers Q&A mode instead of tool-calling
+_QUESTION_RE = re.compile(
+    r"^(?:what|how|why|where|which|who|when|can|does|is\s+there|are\s+there|"
+    r"tell\s+me|explain|describe|show\s+me\s+(?:the|how)|"
+    r"what's|what\s+is|what\s+are|what\s+does|how\s+does|how\s+do\s+i|"
+    r"do\s+i\s+need|should\s+i|could\s+you)\b",
+    re.I,
+)
+
+# Commands that look like questions but should still be tool calls
+_NOT_QUESTION_RE = re.compile(
+    r"^(?:show\s+(?:tree|files|logs|disk)|check\s+(?:port|health|disk)|"
+    r"run\s|execute\s|install\s|create\s|delete\s|edit\s|start\s|stop\s|"
+    r"set\s*up|setup|clone\s|deploy\s|build\s)",
+    re.I,
+)
+
 
 def classify_agents(user_text: str) -> list:
     """Determine which agent(s) should handle this request. Returns list in execution order."""
@@ -116,6 +147,10 @@ def classify_agents(user_text: str) -> list:
     for pattern, agents in _MULTI_AGENT_PATTERNS:
         if pattern.search(text_lower):
             return agents
+
+    # Detect questions (but not imperative commands that start with question words)
+    if _QUESTION_RE.search(text_lower) and not _NOT_QUESTION_RE.search(text_lower):
+        return ["chat"]
 
     scores = {}
     for name, agent in AGENTS.items():
@@ -365,14 +400,17 @@ def _diagnose_via_cloud(tool_name: str, arguments: dict, error: str, context: st
         f"Be specific: which file to edit, which line, what to change."
     )
     tools_model = strip_routing_metadata([TOOL_DIAGNOSE_ERROR])
-    with _suppress_stdout():
-        result = generate_cloud(
-            messages=[{"role": "user", "content": prompt}],
-            tools=tools_model,
-        )
-    calls = result.get("function_calls", [])
-    if calls and calls[0]["name"] == "diagnose_error":
-        return calls[0].get("arguments", {}).get("error_message", "No diagnosis available")
+    try:
+        with _suppress_stdout():
+            result = generate_cloud(
+                messages=[{"role": "user", "content": prompt}],
+                tools=tools_model,
+            )
+        calls = result.get("function_calls", [])
+        if calls and calls[0]["name"] == "diagnose_error":
+            return calls[0].get("arguments", {}).get("error_message", "No diagnosis available")
+    except Exception:
+        pass
     return f"Cloud diagnosis requested for: {error[:200]}"
 
 
@@ -418,7 +456,7 @@ def _handle_cloud_generation(tool_name: str, arguments: dict) -> dict:
         context = arguments.get("context", "")
         prompt = (
             "You are a DevOps setup assistant. Analyze this repository and output "
-            "an ordered list of shell commands to fully set it up from scratch.\n\n"
+            "an ordered list of shell commands to set it up FOR LOCAL DEVELOPMENT.\n\n"
             f"Repo context:\n{context}\n\n"
             "Rules:\n"
             "- Output ONLY shell commands, one per line, no explanations or markdown\n"
@@ -426,9 +464,12 @@ def _handle_cloud_generation(tool_name: str, arguments: dict) -> dict:
             "- If .env.example exists, add: cp .env.example .env\n"
             "- Include a build step only if needed (npm run build, go build, etc.)\n"
             "- End with the start command (uvicorn main:app --reload, npm start, etc.)\n"
-            "- Do NOT include docker commands unless a Dockerfile or docker-compose.yml is present\n"
+            "- PREFER running the app directly (python, node, uvicorn, etc.) over Docker\n"
+            "- If a docker-compose.yml is marked PRODUCTION-ONLY, IGNORE it completely\n"
+            "- Only use docker-compose if it is clearly a local dev setup (no external networks, no Traefik/deploy labels)\n"
+            "- If requirements.txt or package.json exists, always install deps directly even if Dockerfile exists\n"
             "- Do NOT include sudo or system-level package installs\n"
-            "- Output 3 to 8 commands maximum"
+            "- Output 2 to 6 commands maximum"
         )
         # Let exceptions propagate so run_auto_setup can surface the real error message
         raw = _generate_text_via_gemini(prompt)
@@ -513,6 +554,58 @@ def _default_docker_compose(services_str: str) -> str:
 
 # ─── Fix applicator ───────────────────────────────────────────────────────────
 
+_PIP_FAIL_RE = re.compile(
+    r"(?:error.*?building.*?(?:wheel|package)\s+for\s+|"
+    r"Failed to build\s+|"
+    r"Could not build wheels for\s+)"
+    r"([a-zA-Z0-9_-]+)",
+    re.I,
+)
+
+
+def _try_pip_self_heal(command: str, error: str, working_dir: str) -> dict | None:
+    """
+    If a pip install -r requirements.txt fails because one package can't build,
+    retry without the version pin for that package, or skip it and install the rest.
+    Returns the result dict if healed, None otherwise.
+    """
+    if "pip install" not in command or "requirements" not in command:
+        return None
+
+    match = _PIP_FAIL_RE.search(error)
+    if not match:
+        return None
+
+    failing_pkg = match.group(1).lower().strip()
+
+    # Strategy 1: try installing the failing package without version pin
+    r1 = execute_tool("run_command", {
+        "command": f"pip install {failing_pkg}",
+        "working_dir": working_dir,
+    })
+
+    # Strategy 2: install from requirements but skip the failing package
+    r2 = execute_tool("run_command", {
+        "command": (
+            f"pip install -r requirements.txt "
+            f"$(grep -iv '^{failing_pkg}' requirements.txt | tr '\\n' ' ') 2>/dev/null || "
+            f"grep -iv '^{failing_pkg}' requirements.txt | xargs pip install"
+        ),
+        "working_dir": working_dir,
+    })
+
+    # If at least the skip strategy worked, report success
+    if r1.get("success") or r2.get("success"):
+        output_parts = []
+        if r1.get("success"):
+            output_parts.append(f"Installed {failing_pkg} without version pin")
+        if r2.get("success"):
+            output_parts.append(f"Installed remaining packages (skipped pinned {failing_pkg})")
+        return {"success": True, "output": "; ".join(output_parts), "error": ""}
+
+    return None
+
+
 def _extract_and_apply_fix(diagnosis: str, failed_tool: str, failed_args: dict) -> bool:
     """
     Parse diagnosis text and attempt to apply a concrete fix.
@@ -595,6 +688,17 @@ def execute_with_self_heal(tool_name: str, arguments: dict, max_retries: int = 3
         if tool_name in _NO_HEAL_TOOLS:
             break
 
+        # Fast pip-specific self-heal (no cloud call needed)
+        if tool_name == "run_command" and "pip install" in arguments.get("command", ""):
+            pip_fix = _try_pip_self_heal(
+                arguments["command"], error_msg,
+                arguments.get("working_dir", ""),
+            )
+            if pip_fix:
+                if progress_callback:
+                    progress_callback("fix_applied", tool_name, pip_fix["output"], attempt)
+                return StepResult(tool_name, arguments, pip_fix, "local", latency, attempt)
+
         if progress_callback:
             progress_callback("healing", tool_name, error_msg, attempt)
 
@@ -671,9 +775,23 @@ def _discover_repo(ws) -> tuple:
             try:
                 content = match.read_text(errors="replace")
                 limit = 300 if filename.startswith("README") else 800
-                context_parts.append(f"{rel}:\n{content[:limit]}")
-                if filename in ("docker-compose.yml", "docker-compose.yaml", "Dockerfile"):
+                # Detect production-only docker-compose files
+                if filename in ("docker-compose.yml", "docker-compose.yaml"):
                     docker_present = True
+                    is_prod = any(kw in content.lower() for kw in [
+                        "external: true", "traefik", "certresolver",
+                        "letsencrypt", "nginx-proxy", "swarm",
+                        "deploy:", "replicas:",
+                    ])
+                    if is_prod:
+                        context_parts.append(
+                            f"{rel}: [PRODUCTION-ONLY docker-compose — uses external networks/Traefik/deploy config. "
+                            f"DO NOT use for local setup.]\n{content[:limit]}"
+                        )
+                        continue
+                elif filename == "Dockerfile":
+                    docker_present = True
+                context_parts.append(f"{rel}:\n{content[:limit]}")
             except Exception:
                 pass
 
@@ -767,10 +885,21 @@ class Orchestrator:
     def _emit(self, event, tool="", msg="", **extra):
         self.cb(event, tool, msg, **extra)
 
-    def process(self, user_text: str) -> list:
-        """Main entry point: process a user command end-to-end."""
+    def process(self, user_text: str, url_prompt_fn=None) -> list:
+        """
+        Main entry point: process a user command end-to-end.
+
+        url_prompt_fn: optional callback(prompt_text) -> str  that the CLI
+        provides so we can ask the user for a repo URL interactively.
+        """
         agents = classify_agents(user_text)
         self._emit("plan", msg=f"Agents: {' -> '.join(a.upper() for a in agents)}")
+
+        if agents == ["chat"]:
+            return self.ask(user_text)
+
+        if agents == ["clone_setup"]:
+            return self.run_clone_and_setup(user_text, url_prompt_fn)
 
         if agents == ["auto_setup"]:
             return self.run_auto_setup(user_text)
@@ -781,6 +910,58 @@ class Orchestrator:
             all_results.extend(results)
 
         self.history.extend(all_results)
+        return all_results
+
+    def run_clone_and_setup(self, user_text: str, url_prompt_fn=None) -> list:
+        """
+        Clone a repo, switch workspace to it, then auto-setup.
+
+        Extracts URL from user text if present, otherwise prompts interactively.
+        """
+        all_results = []
+
+        # Phase 0: Get the repo URL
+        self._emit("phase_start", msg="0 / 6   CLONE REPOSITORY", phase=0)
+
+        url_match = _GIT_URL_RE.search(user_text)
+        repo_url = url_match.group(1) if url_match else None
+
+        if not repo_url and url_prompt_fn:
+            repo_url = url_prompt_fn("Paste the git repo URL")
+            if repo_url:
+                repo_url = repo_url.strip()
+
+        if not repo_url:
+            self._emit("error", "", "No repo URL provided. Say 'clone <URL>' or paste a URL.")
+            return all_results
+
+        self._emit("start", "clone_repo", f"Cloning {repo_url}")
+        t0 = time.time()
+        result = exec_clone_repo(repo_url)
+        elapsed = (time.time() - t0) * 1000
+
+        sr = StepResult("clone_repo", {"repo_url": repo_url}, result, "local", elapsed)
+        all_results.append(sr)
+
+        if result["success"]:
+            self._emit("success", "clone_repo", result["output"])
+            self._emit("phase_done", msg=f"Cloned into {get_workspace()}", phase=0)
+        else:
+            self._emit("error", "clone_repo", result.get("error", "Clone failed"))
+            # Try self-healing: maybe git isn't installed or URL is wrong
+            self._emit("healing", "clone_repo", result.get("error", ""))
+            diagnosis = _diagnose_via_cloud(
+                "clone_repo",
+                {"repo_url": repo_url},
+                result.get("error", ""),
+                context="Git clone failed during auto-setup",
+            )
+            self._emit("diagnosis", "clone_repo", diagnosis)
+            return all_results
+
+        # Now run the full auto_setup on the cloned repo
+        setup_results = self.run_auto_setup(user_text)
+        all_results.extend(setup_results)
         return all_results
 
     def _run_agent(self, agent_name: str, user_text: str, prior_results: list) -> list:
@@ -998,11 +1179,10 @@ class Orchestrator:
         self.history.extend(all_results)
         return all_results
 
-    def run_documentation_agent(self) -> str:
+    def _gather_project_context(self) -> tuple[str, bool]:
         """
-        Scan the repo for project files and ask Gemini to generate 'How to Run' docs.
-        Called automatically at session exit and after auto_setup.
-        Returns the instructions string, or "" if workspace is empty.
+        Scan the workspace for project files and return (context_string, docker_present).
+        Shared by run_documentation_agent() and ask().
         """
         ws = get_workspace()
         context_parts = []
@@ -1018,7 +1198,7 @@ class Orchestrator:
             pass
 
         if not context_parts:
-            return ""
+            return "", False
 
         SCAN_FILES = [
             "package.json",
@@ -1027,6 +1207,7 @@ class Orchestrator:
             "Makefile", ".env.example", "config.yml", "config.yaml",
             "README.md", "README.rst", "README.txt",
             "docker-compose.yml", "docker-compose.yaml", "Dockerfile",
+            "main.py", "app.py", "server.py", "index.js", "index.ts",
         ]
         docker_present = False
         read_files = set()
@@ -1052,11 +1233,25 @@ class Orchestrator:
                     pass
 
         if self.history:
-            successful = [r.tool_name for r in self.history if r.success]
-            if successful:
-                context_parts.append(f"Operations performed this session: {', '.join(successful)}")
+            history_items = []
+            for r in self.history:
+                status = "OK" if r.success else "FAIL"
+                history_items.append(f"{r.tool_name}({status})")
+            if history_items:
+                context_parts.append(f"Session history: {', '.join(history_items)}")
 
-        context = "\n\n".join(context_parts)
+        return "\n\n".join(context_parts), docker_present
+
+    def run_documentation_agent(self) -> str:
+        """
+        Scan the repo for project files and ask Gemini to generate 'How to Run' docs.
+        Called automatically at session exit and after auto_setup.
+        Returns the instructions string, or "" if workspace is empty.
+        """
+        context, docker_present = self._gather_project_context()
+        if not context:
+            return ""
+
         self._emit("agent_start", msg="[Documentation]")
 
         try:
@@ -1072,9 +1267,55 @@ class Orchestrator:
         self._emit("agent_done", msg="Run instructions generated")
         return result.get("output", "")
 
+    def ask(self, question: str) -> str:
+        """
+        Answer a free-form question about the project using Gemini.
+        Gathers project context and sends it with the question for a natural language answer.
+        """
+        context, _ = self._gather_project_context()
+        if not context:
+            return "No project files found in the workspace. Clone or cd into a repo first."
+
+        prompt = (
+            "You are a helpful DevOps assistant. The user has a project they are working with.\n"
+            "Here is the project context (file listings and contents):\n\n"
+            f"{context}\n\n"
+            "Answer the user's question naturally, concisely, and helpfully. "
+            "Use markdown formatting. If the question is about how to run the app, "
+            "give specific commands. If it's about the codebase, reference specific files.\n\n"
+            f"User's question: {question}"
+        )
+
+        self._emit("agent_start", msg="[Q&A]")
+        try:
+            answer = _generate_text_via_gemini(prompt)
+        except Exception as exc:
+            self._emit("error", "chat", f"Gemini call failed: {exc}")
+            self._emit("agent_done", msg="Failed")
+            return f"Could not get an answer: {exc}"
+
+        self._emit("agent_done", msg="Answered")
+        return answer
+
     def plan(self, user_text: str) -> dict:
         """Return execution plan without running anything."""
         agents = classify_agents(user_text)
+        if agents == ["clone_setup"]:
+            return {
+                "user_text": user_text,
+                "agents": [{
+                    "agent": "clone_setup",
+                    "label": "Clone + Setup",
+                    "tools_available": ["clone_repo", "plan_setup_commands", "run_command", "check_port", "generate_run_instructions"],
+                    "routing_hints": {
+                        "clone_repo": "local",
+                        "plan_setup_commands": "cloud",
+                        "run_command": "local",
+                        "check_port": "local",
+                        "generate_run_instructions": "cloud",
+                    },
+                }],
+            }
         if agents == ["auto_setup"]:
             return {
                 "user_text": user_text,

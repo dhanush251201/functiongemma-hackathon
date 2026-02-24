@@ -216,3 +216,10 @@ docs/
 
 # Demo repos
 demo/
+
+# Claude Code artifacts
+.claude/
+
+# Workspace artifacts
+voicedevops/workspace/*
+!voicedevops/workspace/.gitkeep

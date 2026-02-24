@@ -71,6 +71,36 @@ def _result(success, output="", error="", **extra):
     return {"success": success, "output": str(output), "error": str(error), **extra}
 
 
+# ─── CLONE ────────────────────────────────────────────────────────────────────
+
+def exec_clone_repo(repo_url: str, directory: str = "") -> dict:
+    """Clone a git repo into workspace and switch workspace to the cloned dir."""
+    global WORKSPACE_DIR
+    try:
+        if not directory:
+            # Derive dir name from URL: https://github.com/user/repo.git -> repo
+            directory = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
+
+        target = WORKSPACE_DIR / directory
+        if target.exists():
+            # Already cloned — just switch workspace
+            set_workspace(str(target))
+            return _result(True, output=f"Directory already exists, using {target}")
+
+        result = _run_subprocess(
+            ["git", "clone", "--depth", "1", repo_url, str(target)],
+            cwd=str(WORKSPACE_DIR),
+            timeout=120,
+        )
+        if not result["success"]:
+            return result
+
+        set_workspace(str(target))
+        return _result(True, output=f"Cloned {repo_url} into {target}")
+    except Exception as e:
+        return _result(False, error=str(e))
+
+
 # ─── EXPLORER TOOLS ───────────────────────────────────────────────────────────
 
 def exec_list_files(directory: str) -> dict:
@@ -405,6 +435,7 @@ def exec_diagnose_error(error_message: str, context: str) -> dict:
 # ─── Dispatcher ───────────────────────────────────────────────────────────────
 
 EXECUTORS = {
+    "clone_repo": lambda args: exec_clone_repo(**args),
     "list_files": lambda args: exec_list_files(**args),
     "read_file": lambda args: exec_read_file(**args),
     "find_pattern": lambda args: exec_find_pattern(**args),
